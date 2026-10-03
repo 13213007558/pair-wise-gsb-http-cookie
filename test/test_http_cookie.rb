@@ -154,6 +154,40 @@ class TestHTTPCookie < Test::Unit::TestCase
     }.size
   end
 
+  def test_parse_samesite
+    url = URI.parse('https://www.example.com/')
+    {'Strict' => '', 'Lax' => '', 'None' => '; Secure'}.each { |value, suffix|
+      cookie = HTTP::Cookie.parse("a=1; SameSite=#{value}#{suffix}", url).first
+      assert_equal value.downcase.to_sym, cookie.same_site
+    }
+    assert_nil HTTP::Cookie.parse('a=1', url).first.same_site
+  end
+
+  def test_parse_samesite_is_case_insensitive
+    url = URI.parse('https://www.example.com/')
+    cookie = HTTP::Cookie.parse('a=1; samesite=lAx', url).first
+    assert_equal :lax, cookie.same_site
+  end
+
+  def test_parse_samesite_none_without_secure_is_ignored
+    url = URI.parse('https://www.example.com/')
+    assert_equal 0, HTTP::Cookie.parse('a=1; SameSite=None', url).size
+    assert_equal 1, HTTP::Cookie.parse('a=1; SameSite=None; Secure', url).size
+  end
+
+  def test_parse_unknown_samesite_is_ignored
+    url = URI.parse('https://www.example.com/')
+    assert_equal 0, HTTP::Cookie.parse('a=1; SameSite=Banana', url).size
+  end
+
+  def test_parse_partitioned_implies_samesite_none_secure
+    url = URI.parse('https://www.example.com/')
+    cookie = HTTP::Cookie.parse('a=1; Partitioned', url).first
+    assert cookie.partitioned?
+    assert_equal :none, cookie.same_site
+    assert cookie.secure?
+  end
+
   def test_double_semicolon
     double_semi = 'WSIDC=WEST;; domain=.williams-sonoma.com; path=/'
     url = URI.parse('http://williams-sonoma.com/')
@@ -1183,6 +1217,9 @@ class TestHTTPCookie < Test::Unit::TestCase
         httponly: cookie.httponly?,
         max_age: 3600,
         name: 'Foo',
+        same_site: nil,
+        partitioned: false,
+        partition_key: nil,
         path: '/',
         secure: cookie.secure?,
         value: 'Bar',
@@ -1202,6 +1239,9 @@ class TestHTTPCookie < Test::Unit::TestCase
         httponly: cookie.httponly?,
         max_age: nil,
         name: 'Foo',
+        same_site: nil,
+        partitioned: false,
+        partition_key: nil,
         path: '/',
         secure: cookie.secure?,
         value: 'Bar',

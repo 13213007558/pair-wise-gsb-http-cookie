@@ -100,6 +100,46 @@ Or install it yourself as:
 
 
     ########################
+    # SameSite / Partitioned
+    ########################
+
+    # With a request context, cookies are selected according to the
+    # schemeful SameSite rules (RFC 6265bis) and the top-level-site
+    # partition of Partitioned (CHIPS) cookies.
+
+    # Storing a Partitioned cookie: pass the site of the top-level page
+    # so that its partition key is set.
+    jar.parse(set_cookie, request_uri,
+              top_level_site: 'https://shop.example')
+
+    # Selecting cookies for a cross-site POST (an unsafe method that is
+    # not a top-level navigation): Strict and Lax cookies are withheld.
+    context = HTTP::CookieJar::RequestContext.new(
+      request_uri,
+      top_level_site: 'https://shop.example',
+      initiator_site: 'https://shop.example',
+      top_level_navigation: false,
+      method: 'POST'
+    )
+    header['Cookie'] =
+      HTTP::Cookie.cookie_value(jar.cookies(request_uri, context: context))
+
+    # Following redirects? Hand the chain in so a chain that leaves the
+    # top-level site is treated as cross-site.
+    context = HTTP::CookieJar::RequestContext.new(
+      request_uri,
+      top_level_site: 'https://shop.example',
+      top_level_navigation: true,
+      method: 'GET',
+      redirect_chain: ['https://shop.example/out']
+    )
+
+    # Calling #cookies without a context keeps the legacy behavior in
+    # which every cookie valid for the URL is returned, regardless of
+    # SameSite or partitioning.
+
+
+    ########################
     # Server side example
     ########################
 

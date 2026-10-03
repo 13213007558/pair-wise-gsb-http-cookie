@@ -34,7 +34,9 @@ class HTTP::CookieJar
       @jar = {
       # hostname => {
       #   path => {
-      #     name => cookie,
+      #     partition_key => {
+      #       name => cookie,
+      #     },
       #     ...
       #   },
       #   ...
@@ -51,35 +53,40 @@ class HTTP::CookieJar
     end
 
     def add(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
-      path_cookies[cookie.name] = cookie
+      path_cookies = (@jar[cookie.domain] ||= {})[cookie.path] ||= {}
+      partition_cookies = path_cookies[cookie.partition_key] ||= {}
+      partition_cookies[cookie.name] = cookie
       cleanup if (@gc_index += 1) >= @gc_threshold
       self
     end
 
     def delete(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
-      path_cookies.delete(cookie.name)
+      paths = @jar[cookie.domain] or return self
+      path_cookies = paths[cookie.path] or return self
+      partition_cookies = path_cookies[cookie.partition_key] or return self
+      partition_cookies.delete(cookie.name)
       self
     end
 
-    def each(uri = nil) # :yield: cookie
+    def each(uri = nil, context = nil) # :yield: cookie
       now = Time.now
       if uri
         tpath = uri.path
         @jar.each { |domain, paths|
           paths.each { |path, hash|
             next unless HTTP::Cookie.path_match?(path, tpath)
-            hash.delete_if { |name, cookie|
-              if cookie.expired?(now)
-                true
-              else
-                if cookie.valid_for_uri?(uri)
-                  cookie.accessed_at = now
-                  yield cookie
+            hash.each { |partition_key, partition_cookies|
+              partition_cookies.delete_if { |name, cookie|
+                if cookie.expired?(now)
+                  true
+                else
+                  if valid_for_request?(cookie, uri, context)
+                    cookie.accessed_at = now
+                    yield cookie
+                  end
+                  false
                 end
-                false
-              end
+              }
             }
           }
         }
@@ -87,13 +94,15 @@ class HTTP::CookieJar
         synchronize {
           @jar.each { |domain, paths|
             paths.each { |path, hash|
-              hash.delete_if { |name, cookie|
-                if cookie.expired?(now)
-                  true
-                else
-                  yield cookie
-                  false
-                end
+              hash.each { |partition_key, partition_cookies|
+                partition_cookies.delete_if { |name, cookie|
+                  if cookie.expired?(now)
+                    true
+                  else
+                    yield cookie
+                    false
+                  end
+                }
               }
             }
           }
@@ -118,13 +127,15 @@ class HTTP::CookieJar
           domain_cookies = []
 
           paths.each { |path, hash|
-            hash.delete_if { |name, cookie|
-              if cookie.expired?(now) || (session && cookie.session?)
-                true
-              else
-                domain_cookies << cookie
-                false
-              end
+            hash.each { |partition_key, partition_cookies|
+              partition_cookies.delete_if { |name, cookie|
+                if cookie.expired?(now) || (session && cookie.session?)
+                  true
+                else
+                  domain_cookies << cookie
+                  false
+                end
+              }
             }
           }
 
@@ -147,6 +158,9 @@ class HTTP::CookieJar
 
         @jar.delete_if { |domain, paths|
           paths.delete_if { |path, hash|
+            hash.delete_if { |partition_key, partition_cookies|
+              partition_cookies.empty?
+            }
             hash.empty?
           }
           paths.empty?
@@ -155,6 +169,20 @@ class HTTP::CookieJar
         @gc_index = 0
       }
       self
+    end
+
+    private
+
+    # Selects a cookie for a request.  With no request context the
+    # legacy rule (domain, path, secure) is used.  With a context the
+    # SameSite attribute and the Partitioned-cookie partition key are
+    # honored as well.
+    def valid_for_request?(cookie, uri, context)
+      if context
+        cookie.sendable_for_context?(context)
+      else
+        cookie.valid_for_uri?(uri)
+      end
     end
   end
 end

@@ -358,7 +358,7 @@ class HTTP::CookieJar
     def db_add(cookie)
       @stmt[:add].execute({
           :baseDomain => cookie.domain_name.domain || cookie.domain,
-          :originAttributes => @origin_attributes,
+          :originAttributes => origin_attributes_for(cookie),
           :name => cookie.name, :value => cookie.value,
           :host => cookie.dot_domain,
           :path => cookie.path,
@@ -379,6 +379,7 @@ class HTTP::CookieJar
       DELETE FROM moz_cookies
         WHERE appId = :appId AND
               inBrowserElement = :inBrowserElement AND
+              originAttributes = :originAttributes AND
               name = :name AND
               host = :host AND
               path = :path
@@ -388,11 +389,25 @@ class HTTP::CookieJar
       @stmt[:delete].execute({
           :appId => @app_id,
           :inBrowserElement => @in_browser_element ? 1 : 0,
+          :originAttributes => origin_attributes_for(cookie),
           :name => cookie.name,
           :host => cookie.dot_domain,
           :path => cookie.path,
         })
       self
+    end
+
+    private
+
+    # Extends the store's originAttributes with the cookie's
+    # partition key, so that Partitioned cookies for distinct
+    # top-level sites (and the unpartitioned cookie) coexist in the
+    # database and are deleted independently.
+    def origin_attributes_for(cookie)
+      key = cookie.partition_key
+      return @origin_attributes if key.nil?
+      suffix = encode_www_form([['partitionKey', key]])
+      @origin_attributes.empty? ? suffix : @origin_attributes + '&' + suffix
     end
 
     if RUBY_VERSION >= '1.9'
@@ -461,7 +476,7 @@ class HTTP::CookieJar
               expiry >= :expiry
     SQL
 
-    def each(uri = nil, &block) # :yield: cookie
+    def each(uri = nil, context = nil, &block) # :yield: cookie
       now = Time.now
       if uri
         thost = DomainName.new(uri.host)
@@ -486,9 +501,15 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = secure
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              partition_key = get_query_param(row['originAttributes'].to_s, 'partitionKey')
+              if partition_key
+                attrs[:partitioned]  = true
+                attrs[:same_site]   = :none
+                attrs[:partition_key] = partition_key
+              end
             })
 
-          if cookie.valid_for_uri?(uri)
+          if context ? cookie.sendable_for_context?(context) : cookie.valid_for_uri?(uri)
             cookie.accessed_at = now
             @stmt[:update_lastaccessed].execute({
                 'lastAccessed' => serialize_usectime(now),
@@ -497,7 +518,7 @@ class HTTP::CookieJar
             yield cookie
           end
         }
-        @sjar.each(uri, &block)
+        @sjar.each(uri, context, &block)
       else
         @stmt[:all_cookies].execute({
             :appId => @app_id,
@@ -514,11 +535,17 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = row['isSecure'] != 0
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              partition_key = get_query_param(row['originAttributes'].to_s, 'partitionKey')
+              if partition_key
+                attrs[:partitioned]  = true
+                attrs[:same_site]   = :none
+                attrs[:partition_key] = partition_key
+              end
             })
 
           yield cookie
         }
-        @sjar.each(&block)
+        @sjar.each(nil, nil, &block)
       end
       self
     end

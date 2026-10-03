@@ -110,15 +110,22 @@ class HTTP::CookieJar
   # Gets an array of cookies sorted by the path and creation time.  If
   # `url` is given, only ones that should be sent to the URL/URI are
   # selected, with the access time of each of them updated.
-  def cookies(url = nil)
-    each(url).sort
+  #
+  # When a `:context` (HTTP::CookieJar::RequestContext, an option hash,
+  # or a request URI) is given, cookies are additionally filtered by
+  # the schemeful SameSite attribute and the top-level-site
+  # partition of Partitioned cookies.  Without a context the legacy
+  # behavior is retained, where every cookie valid for the URL is
+  # returned regardless of SameSite or partitioning.
+  def cookies(url = nil, context: nil)
+    each(url, context: context).sort
   end
 
   # Tests if the jar is empty.  If `url` is given, tests if there is
-  # no cookie for the URL.
-  def empty?(url = nil)
+  # no cookie for the URL.  See #cookies for the `:context` option.
+  def empty?(url = nil, context: nil)
     if url
-      each(url) { return false }
+      each(url, context: context) { return false }
       return true
     else
       @store.empty?
@@ -135,15 +142,42 @@ class HTTP::CookieJar
   #
   # If (and only if) the `uri` option is given, last access time of
   # each cookie is updated to the current time.
-  def each(uri = nil, &block) # :yield: cookie
-    block_given? or return enum_for(__method__, uri)
+  #
+  # The optional `:context` enables schemeful SameSite filtering and
+  # Partitioned-cookie selection; see HTTP::CookieJar::RequestContext
+  # and #cookies.  When no context is given the legacy selection
+  # behavior is used.
+  def each(uri = nil, context: nil, &block) # :yield: cookie
+    block_given? or return enum_for(__method__, uri, :context => context)
 
     if uri
       uri = HTTP::Cookie::URIParser.parse(uri)
       return self unless URI::HTTP === uri && uri.host
     end
 
-    @store.each(uri, &block)
+    context = RequestContext.associate(context)
+    if context
+      if uri
+        # A pre-built RequestContext is trusted; when the context was
+        # given as an option hash without a request URI, use the one
+        # passed as the first argument.
+        unless context.request_uri == uri
+          context = RequestContext.new(uri,
+            top_level_site: context.top_level_site,
+            initiator_site: context.initiator_site,
+            top_level_navigation: context.top_level_navigation?,
+            method: context.method,
+            redirect_chain: context.redirect_chain)
+        end
+      else
+        uri = context.request_uri
+        unless URI::HTTP === uri && uri.host
+          return self
+        end
+      end
+    end
+
+    @store.each(uri, context, &block)
     self
   end
   include Enumerable
@@ -163,15 +197,32 @@ class HTTP::CookieJar
   #         }
   #
   # See HTTP::Cookie.parse for available options.
+  #
+  # In addition to the options of HTTP::Cookie.parse, `:top_level_site`
+  # gives the site of the top-level page that loaded `origin`.  It is
+  # only used to set the partition key of Partitioned (CHIPS)
+  # cookies; when omitted, a Partitioned cookie is stored with a nil
+  # partition key.
   def parse(set_cookie, origin, options = nil) # :yield: cookie
+    top_level_site = options && options[:top_level_site]
+    top_level_site &&= Site.from(top_level_site).to_s
+
+    partition = lambda { |cookie|
+      if cookie.partitioned? && cookie.partition_key.nil?
+        cookie.partition_key = top_level_site
+      end
+    }
+
     if block_given?
       HTTP::Cookie.parse(set_cookie, origin, options).tap { |cookies|
         cookies.select! { |cookie|
+          partition.call(cookie)
           yield(cookie) && add(cookie)
         }
       }
     else
       HTTP::Cookie.parse(set_cookie, origin, options) { |cookie|
+        partition.call(cookie)
         add(cookie)
       }
     end
@@ -328,3 +379,8 @@ end
 
 require 'http/cookie_jar/abstract_store'
 require 'http/cookie_jar/abstract_saver'
+
+# RequestContext and Site are defined after the store and saver
+# implementation files are required, mirroring the load order of the
+# other jar components.
+require 'http/cookie_jar/request_context'

@@ -1,3 +1,21 @@
+## Unreleased
+
+- Add an explicit request context (`HTTP::CookieJar::RequestContext`)
+  carrying the top-level site, the initiator site, the top-level-
+  navigation flag, the HTTP method and the redirect chain.  When a
+  context is given, `HTTP::CookieJar#cookies`/`#each`/`#empty?`
+  select cookies by the schemeful SameSite rules (`Strict`, `Lax`,
+  `None`) and only send `Partitioned` (CHIPS) cookies whose partition
+  key matches the top-level site.  Without a context the previous
+  behavior is retained.
+- Parse and store the `SameSite` and `Partitioned` attributes of
+  `Set-Cookie`; `SameSite=None` requires `Secure`, an unknown
+  `SameSite` value is ignored, and `Partitioned` implies
+  `SameSite=None; Secure`.  Partitioned cookies are keyed by the
+  top-level site in the hash store, preserved across deletion and YAML
+  serialization, and distinguished via `originAttributes` in the
+  Mozilla store.
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

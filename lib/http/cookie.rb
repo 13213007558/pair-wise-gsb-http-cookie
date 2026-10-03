@@ -31,6 +31,8 @@ class HTTP::Cookie
     name        value
     domain      for_domain  path
     secure      httponly
+    same_site
+    partitioned partition_key
     expires     max_age
     created_at  accessed_at
   ]
@@ -134,6 +136,9 @@ class HTTP::Cookie
     @name = @origin = @domain = @path =
       @expires = @max_age = nil
     @for_domain = @secure = @httponly = false
+    @same_site = nil
+    @partitioned = false
+    @partition_key = nil
     @session = true
     @created_at = @accessed_at = Time.now
     case argc = args.size
@@ -182,6 +187,12 @@ class HTTP::Cookie
         @httponly = val
       when :secure, :secure?
         @secure = val
+      when :same_site, :samesite
+        self.same_site = val
+      when :partitioned, :partitioned?
+        self.partitioned = val
+      when :partition_key
+        self.partition_key = val
       when Symbol
         setter = :"#{key}="
         if respond_to?(setter)
@@ -291,6 +302,7 @@ class HTTP::Cookie
             next
           end
           cookie.created_at = created_at if created_at
+          invalid_samesite = false
           attrs.each { |aname, avalue|
             begin
               case aname
@@ -312,6 +324,18 @@ class HTTP::Cookie
                 cookie.secure = avalue
               when 'httponly'
                 cookie.httponly = avalue
+              when 'samesite'
+                begin
+                  cookie.same_site = avalue
+                rescue ArgumentError
+                  # An unrecognized SameSite value means the cookie is
+                  # ignored entirely (RFC 6265bis 5.2).
+                  invalid_samesite = true
+                  logger.warn("Ignoring cookie with invalid SameSite: #{avalue}") if logger
+                  next
+                end
+              when 'partitioned'
+                cookie.partitioned = true
               end
             rescue => e
               logger.warn("Couldn't parse #{aname} '#{avalue}': #{e}") if logger
@@ -320,7 +344,20 @@ class HTTP::Cookie
 
           cookie.origin = origin
 
+          next if invalid_samesite
+
           cookie.acceptable? or next
+
+          # RFC 6265bis: SameSite=None must be marked Secure.  A
+          # Partitioned cookie implies SameSite=None; Secure.
+          if cookie.partitioned?
+            cookie.same_site = :none
+            cookie.secure = true
+          end
+          if cookie.same_site == :none && !cookie.secure?
+            logger.warn("Ignoring SameSite=None cookie without the Secure attribute") if logger
+            next
+          end
 
           yield cookie if block_given?
 
@@ -479,6 +516,51 @@ class HTTP::Cookie
   attr_accessor :httponly
   alias httponly? httponly
 
+  # The SameSite attribute (`nil`, `:strict`, `:lax`, or `:none`).
+  #
+  # `nil` means that the attribute is absent.  The setter accepts a
+  # downcased symbol (`:strict`, `:lax`, `:none`) or a case-
+  # insensitive string ("Strict", "Lax", "None"); any other value
+  # raises ArgumentError.
+  attr_reader :same_site
+
+  # See #same_site.
+  def same_site= value
+    case value
+    when nil
+      @same_site = nil
+    when Symbol, String
+      normalized = value.to_s.downcase
+      case normalized
+      when 'strict'
+        @same_site = :strict
+      when 'lax'
+        @same_site = :lax
+      when 'none'
+        @same_site = :none
+      else
+        raise ArgumentError, "invalid SameSite attribute: #{value.inspect}"
+      end
+    else
+      raise TypeError, "#{value.class} is not a Symbol or String"
+    end
+  end
+
+  alias same_site? same_site
+
+  # The Partitioned flag. (CHIPS)
+  #
+  # A partitioned cookie is only sent in requests whose top-level
+  # site equals #partition_key, and it is stored separately from any
+  # unpartitioned cookie that shares the same name, domain and path.
+  attr_accessor :partitioned
+  alias partitioned? partitioned
+
+  # The partition key, the top-level site ("scheme://eTLD+1") under
+  # which the cookie was partitioned.  It is nil for an unpartitioned
+  # cookie.
+  attr_accessor :partition_key
+
   # The session flag. (the opposite of persistent-flag)
   #
   # A cookie with this flag on should be hidden from a client script.
@@ -596,6 +678,40 @@ class HTTP::Cookie
     acceptable_from_uri?(uri) && HTTP::Cookie.path_match?(@path, uri.path)
   end
 
+  # Tests if it is OK to send this cookie in the request described by
+  # `context`, an HTTP::CookieJar::RequestContext (or something
+  # convertible to it).  This extends #valid_for_uri? with the
+  # schemeful SameSite rules (RFC 6265bis) and the Partitioned cookie
+  # semantics (CHIPS).
+  #
+  # A RuntimeError is raised if the cookie's domain is unknown.
+  def sendable_for_context?(context)
+    context = HTTP::CookieJar::RequestContext.associate(context)
+    return false unless valid_for_uri?(context.request_uri)
+
+    if @partitioned
+      # A partitioned cookie is only sent when the partition key
+      # matches the top-level site of the request.
+      return false unless @partition_key &&
+        @partition_key == context.top_level_site.to_s
+    end
+
+    case @same_site
+    when :none
+      # SameSite=None requires the Secure attribute and a secure
+      # transport.
+      return false unless @secure && URI::HTTPS === context.request_uri
+    when :lax
+      return false unless context.same_site? ||
+        (context.top_level_navigation? && context.safe_method?)
+    when :strict
+      return false unless context.same_site?
+    else
+      # No SameSite attribute: the legacy, permissive behavior.
+    end
+    true
+  end
+
   # Returns a string for use in the Cookie header, i.e. `name=value`
   # or `name="value"`.
   def cookie_value
@@ -633,6 +749,17 @@ class HTTP::Cookie
     end
     if @secure
       string << "; Secure"
+    end
+    case @same_site
+    when :strict
+      string << "; SameSite=Strict"
+    when :lax
+      string << "; SameSite=Lax"
+    when :none
+      string << "; SameSite=None"
+    end
+    if @partitioned
+      string << "; Partitioned"
     end
     string
   end

@@ -71,7 +71,7 @@ class HTTP::CookieJar::AbstractStore
   # each cookie is updated to the current time.
   #
   # This is an abstract method that each subclass must override.
-  def each(uri = nil, &block) # :yield: cookie
+  def each(uri = nil, context = nil, &block) # :yield: cookie
     # if uri
     #   ...
     # else
