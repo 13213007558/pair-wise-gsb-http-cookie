@@ -121,6 +121,48 @@ Or install it yourself as:
     header['Set-Cookie'] = cookie2.set_cookie_value
 
 
+### SameSite and Partitioned cookies with a request context
+
+Pass an `HTTP::Cookie::RequestContext` to let the jar apply
+"schemeful" SameSite filtering (the scheme is part of the site) and
+CHIPS partitioning.  Without a context, every method keeps the
+legacy behavior of ignoring SameSite.
+
+    jar = HTTP::CookieJar.new
+
+    # A tracker responds while embedded on https://www.example.com
+    response_context = HTTP::Cookie::RequestContext.new(
+      'https://tracker.example/set',
+      top_level_site: 'https://www.example.com',
+      top_level_navigation: false)
+    jar.parse('sid=1; Secure; SameSite=None; Path=/; Partitioned',
+              'https://tracker.example/set',
+              context: response_context)
+
+    # A cross-site POST subresource sends the partitioned cookie
+    # because it matches the top-level partition
+    request_context = HTTP::Cookie::RequestContext.new(
+      'https://tracker.example/',
+      top_level_site: 'https://www.example.com',
+      initiator_site: 'https://www.example.com',
+      top_level_navigation: false,
+      method: 'POST')
+    jar.cookies('https://tracker.example/', context: request_context)
+
+    # Redirect chains are passed in order, oldest hop first:
+    redirected = HTTP::Cookie::RequestContext.new(
+      'https://tracker.example/',
+      top_level_site: 'https://www.example.com',
+      method: 'GET',
+      redirect_chain: [
+        { uri: 'https://www.example.com/login', method: 'POST' }
+      ])
+
+The same third-party domain can thus hold same-named Partitioned
+cookies in different top-level partitions; `jar.delete(cookie,
+context)` and YAML serialization preserve the partition, while the
+flat cookies.txt format skips Partitioned cookies.
+
 ## Incompatibilities with Mechanize::Cookie/CookieJar
 
 There are several incompatibilities between

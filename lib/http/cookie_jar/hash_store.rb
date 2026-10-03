@@ -34,7 +34,9 @@ class HTTP::CookieJar
       @jar = {
       # hostname => {
       #   path => {
-      #     name => cookie,
+      #     partition_key => {
+      #       name => cookie,
+      #     },
       #     ...
       #   },
       #   ...
@@ -51,51 +53,83 @@ class HTTP::CookieJar
     end
 
     def add(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
+      partition = cookie.partitioned? ? cookie.partition_key : nil
+      hashes = (@jar[cookie.domain] ||= {})[cookie.path] ||= {}
+      path_cookies = hashes[partition] ||= {}
       path_cookies[cookie.name] = cookie
       cleanup if (@gc_index += 1) >= @gc_threshold
       self
     end
 
     def delete(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
-      path_cookies.delete(cookie.name)
+      partition = cookie.partitioned? ? cookie.partition_key : nil
+      if paths = @jar[cookie.domain]
+        if hashes = paths[cookie.path]
+          if path_cookies = hashes[partition]
+            path_cookies.delete(cookie.name)
+            hashes.delete(partition) if path_cookies.empty?
+            paths.delete(cookie.path) if hashes.empty?
+            @jar.delete(cookie.domain) if paths.empty?
+          end
+        end
+      end
       self
     end
 
-    def each(uri = nil) # :yield: cookie
+    def each(uri = nil, context = nil) # :yield: cookie
       now = Time.now
       if uri
         tpath = uri.path
+        wanted_partitions = context && [nil, context.top_level_site]
         @jar.each { |domain, paths|
+          empty_paths = []
           paths.each { |path, hash|
             next unless HTTP::Cookie.path_match?(path, tpath)
-            hash.delete_if { |name, cookie|
-              if cookie.expired?(now)
-                true
-              else
-                if cookie.valid_for_uri?(uri)
+            empty_partitions = []
+            hash.each { |partition, path_cookies|
+              next if wanted_partitions &&
+                !wanted_partitions.include?(partition)
+              expired_names = []
+              path_cookies.each { |name, cookie|
+                if cookie.expired?(now)
+                  expired_names << name
+                elsif cookie.valid_for_uri?(uri)
                   cookie.accessed_at = now
                   yield cookie
                 end
-                false
-              end
+              }
+              expired_names.each { |name| path_cookies.delete(name) }
+              empty_partitions << partition if path_cookies.empty?
             }
+            empty_partitions.each { |partition| hash.delete(partition) }
+            empty_paths << path if hash.empty?
           }
+          empty_paths.each { |path| paths.delete(path) }
+          @jar.delete(domain) if paths.empty?
         }
       else
         synchronize {
           @jar.each { |domain, paths|
+            empty_paths = []
             paths.each { |path, hash|
-              hash.delete_if { |name, cookie|
-                if cookie.expired?(now)
-                  true
-                else
-                  yield cookie
-                  false
-                end
+              empty_partitions = []
+              hash.each { |partition, path_cookies|
+                expired_names = []
+                path_cookies.each { |name, cookie|
+                  if cookie.expired?(now)
+                    expired_names << name
+                  else
+                    yield cookie
+                  end
+                }
+                expired_names.each { |name| path_cookies.delete(name) }
+                empty_partitions << partition if path_cookies.empty?
               }
+              empty_partitions.each { |partition| hash.delete(partition) }
+              empty_paths << path if hash.empty?
             }
+            empty_paths.each { |path| paths.delete(path) }
+            @jar.delete(domain) if paths.empty?
           }
         }
       end
@@ -117,16 +151,25 @@ class HTTP::CookieJar
         @jar.each { |domain, paths|
           domain_cookies = []
 
+          empty_paths = []
           paths.each { |path, hash|
-            hash.delete_if { |name, cookie|
-              if cookie.expired?(now) || (session && cookie.session?)
-                true
-              else
-                domain_cookies << cookie
-                false
-              end
+            empty_partitions = []
+            hash.each { |partition, path_cookies|
+              expired_names = []
+              path_cookies.each { |name, cookie|
+                if cookie.expired?(now) || (session && cookie.session?)
+                  expired_names << name
+                else
+                  domain_cookies << cookie
+                end
+              }
+              expired_names.each { |name| path_cookies.delete(name) }
+              empty_partitions << partition if path_cookies.empty?
             }
+            empty_partitions.each { |partition| hash.delete(partition) }
+            empty_paths << path if hash.empty?
           }
+          empty_paths.each { |path| paths.delete(path) }
 
           if (debt = domain_cookies.size - HTTP::Cookie::MAX_COOKIES_PER_DOMAIN) > 0
             domain_cookies.sort_by!(&:created_at)

@@ -34,6 +34,12 @@ class HTTP::Cookie
     expires     max_age
     created_at  accessed_at
   ]
+
+  # Additional properties serialized with YAML, which are kept out
+  # of PERSISTENT_PROPERTIES so #to_h stays backwards compatible.
+  EXTENDED_PERSISTENT_PROPERTIES = %w[
+    same_site partitioned partition_key
+  ]
   # :startdoc:
 
   # The cookie name.  It may not be nil or empty.
@@ -134,6 +140,9 @@ class HTTP::Cookie
     @name = @origin = @domain = @path =
       @expires = @max_age = nil
     @for_domain = @secure = @httponly = false
+    @same_site = nil
+    @partitioned = false
+    @partition_key = nil
     @session = true
     @created_at = @accessed_at = Time.now
     case argc = args.size
@@ -182,6 +191,12 @@ class HTTP::Cookie
         @httponly = val
       when :secure, :secure?
         @secure = val
+      when :samesite, :same_site
+        self.same_site = val
+      when :partitioned, :partitioned?
+        self.partitioned = val
+      when :partition_key
+        self.partition_key = val
       when Symbol
         setter = :"#{key}="
         if respond_to?(setter)
@@ -312,6 +327,14 @@ class HTTP::Cookie
                 cookie.secure = avalue
               when 'httponly'
                 cookie.httponly = avalue
+              when 'samesite'
+                begin
+                  cookie.same_site = avalue
+                rescue ArgumentError, TypeError
+                  # RFC 6265bis: unknown SameSite values are ignored.
+                end
+              when 'partitioned'
+                cookie.partitioned = avalue
               end
             rescue => e
               logger.warn("Couldn't parse #{aname} '#{avalue}': #{e}") if logger
@@ -479,6 +502,62 @@ class HTTP::Cookie
   attr_accessor :httponly
   alias httponly? httponly
 
+  # Canonical SameSite attribute values.
+  SAME_SITE_STRICT = 'Strict'
+  SAME_SITE_LAX    = 'Lax'
+  SAME_SITE_NONE   = 'None'
+
+  # The SameSite attribute value, one of "Strict", "Lax",
+  # "None", or nil when the attribute is absent.
+  #
+  # The setter accepts a string or symbol in any case; unknown
+  # values are rejected with ArgumentError, following RFC 6265bis.
+  def same_site=(value)
+    case value
+    when nil
+      @same_site = nil
+    when Symbol
+      self.same_site = value.to_s
+    when String
+      case value.downcase
+      when 'strict'
+        @same_site = SAME_SITE_STRICT
+      when 'lax'
+        @same_site = SAME_SITE_LAX
+      when 'none'
+        @same_site = SAME_SITE_NONE
+      else
+        raise ArgumentError, "invalid SameSite value: #{value.inspect}"
+      end
+    else
+      raise TypeError, "#{value.class} is not a String"
+    end
+  end
+
+  attr_reader :same_site
+
+  # The Partitioned flag (CHIPS).  A partitioned cookie is only sent
+  # when the request's top-level site partition equals
+  # #partition_key.
+  attr_accessor :partitioned
+  alias partitioned? partitioned
+
+  # The schemeful top-level site this cookie is partitioned under,
+  # e.g. "https://example.com", or nil for an unpartitioned cookie.
+  attr_accessor :partition_key
+
+  def same_site_strict?
+    @same_site == SAME_SITE_STRICT
+  end
+
+  def same_site_lax?
+    @same_site == SAME_SITE_LAX
+  end
+
+  def same_site_none?
+    @same_site == SAME_SITE_NONE
+  end
+
   # The session flag. (the opposite of persistent-flag)
   #
   # A cookie with this flag on should be hidden from a client script.
@@ -634,6 +713,12 @@ class HTTP::Cookie
     if @secure
       string << "; Secure"
     end
+    if @same_site
+      string << "; SameSite=#{@same_site}"
+    end
+    if @partitioned
+      string << "; Partitioned"
+    end
     string
   end
 
@@ -662,12 +747,13 @@ class HTTP::Cookie
 
   # YAML serialization helper for Syck.
   def to_yaml_properties
-    PERSISTENT_PROPERTIES.map { |name| "@#{name}" }
+    (PERSISTENT_PROPERTIES + EXTENDED_PERSISTENT_PROPERTIES)
+      .map { |name| "@#{name}" }
   end
 
   # YAML serialization helper for Psych.
   def encode_with(coder)
-    PERSISTENT_PROPERTIES.each { |key|
+    (PERSISTENT_PROPERTIES + EXTENDED_PERSISTENT_PROPERTIES).each { |key|
       coder[key.to_s] = instance_variable_get(:"@#{key}")
     }
   end
@@ -686,7 +772,7 @@ class HTTP::Cookie
       when 'expires'
         # avoid clobbering max_age
         expires = value
-      when *PERSISTENT_PROPERTIES
+      when *(PERSISTENT_PROPERTIES + EXTENDED_PERSISTENT_PROPERTIES)
         __send__(:"#{key}=", value)
       end
     }

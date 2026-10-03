@@ -1,3 +1,10 @@
+## 1.2.0.beta
+
+- Add an explicit request context (`HTTP::Cookie::RequestContext`) carrying the schemeful top-level site, initiator site, HTTP method, top-level-navigation flag and redirect chain.  `HTTP::CookieJar#cookies`/`#each`/`#empty?` accept a `context:` keyword and select cookies following schemeful SameSite rules; `#add`/`#parse` accept a context to stamp cookies.
+- Parse and serialize the `SameSite` (`Strict`/`Lax`/`None`) and `Partitioned` (CHIPS) attributes.  SameSite=None and Partitioned cookies set via a context are required to carry `Secure`; Partitioned cookies also require SameSite=None.
+- Partitioned cookies are keyed by their top-level site partition in every backend (HashStore, MozillaStore schema v8), so a third-party domain can hold a same-named cookie in multiple partitions; deletion and YAML serialization keep partitions apart (cookies.txt, which cannot express partitions, skips them).
+- When no context is given every method keeps its previous SameSite-agnostic behavior.
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

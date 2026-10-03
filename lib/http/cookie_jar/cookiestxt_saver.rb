@@ -24,6 +24,10 @@ class HTTP::CookieJar::CookiestxtSaver < HTTP::CookieJar::AbstractSaver
     io.puts @header if @header
     jar.each { |cookie|
       next if !@session && cookie.session?
+      # The cookies.txt format has no notion of CHIPS partitions;
+      # writing a partitioned cookie would make it indistinguishable
+      # from its unpartitioned counterpart.
+      next if cookie.partitioned?
       io.print cookie_to_record(cookie)
     }
   end

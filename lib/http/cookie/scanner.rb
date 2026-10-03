@@ -198,7 +198,7 @@ class HTTP::Cookie::Scanner < StringScanner
           # A relative path must be ignored rather than normalizing it
           # to "/".
           next unless /\A\//.match(avalue)
-        when 'secure', 'httponly'
+        when 'secure', 'httponly', 'partitioned'
           # RFC 6265 5.2.5, 5.2.6
           avalue = true
         end

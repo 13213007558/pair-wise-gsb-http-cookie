@@ -85,7 +85,21 @@ class HTTP::CookieJar
   #       # HTTP::Cookie
   #       jar.origin = origin
   #       jar.add(cookie)     # acceptance check is performed
-  def add(cookie)
+  def add(cookie, context = nil)
+    cookie = cookie.dup
+    context = HTTP::Cookie::RequestContext === context ? context : nil
+
+    if context
+      cookie.origin ||= context.uri
+      cookie.partition_key = context.top_level_site if cookie.partitioned?
+      validate_cookie_for_context(cookie)
+    elsif cookie.partitioned? && cookie.partition_key.nil?
+      # A Partitioned cookie without a known partition cannot be
+      # stored unambiguously.
+      raise ArgumentError,
+        "a Partitioned cookie requires a request context with a top-level site"
+    end
+
     @store.add(cookie) if
       begin
         cookie.acceptable?
@@ -99,10 +113,21 @@ class HTTP::CookieJar
   # Deletes a cookie that has the same name, domain and path as a
   # given cookie from the jar and returns self.
   #
+  # When a request context is given, the Partitioned cookie stored
+  # under the context's top-level site partition is deleted; the
+  # unpartitioned cookie (or a cookie in another partition) with the
+  # same name/domain/path is left untouched.  Without a context the
+  # unpartitioned cookie is deleted.
+  #
   # How the `for_domain` flag value affects the set of deleted cookies
   # depends on the store used.  See individual store classes for that
   # matter.
-  def delete(cookie)
+  def delete(cookie, context = nil)
+    if context
+      cookie = cookie.dup
+      cookie.partitioned = true
+      cookie.partition_key = context.top_level_site
+    end
     @store.delete(cookie)
     self
   end
@@ -110,15 +135,15 @@ class HTTP::CookieJar
   # Gets an array of cookies sorted by the path and creation time.  If
   # `url` is given, only ones that should be sent to the URL/URI are
   # selected, with the access time of each of them updated.
-  def cookies(url = nil)
-    each(url).sort
+  def cookies(url = nil, context: nil)
+    each(url, context: context).sort
   end
 
   # Tests if the jar is empty.  If `url` is given, tests if there is
   # no cookie for the URL.
-  def empty?(url = nil)
+  def empty?(url = nil, context: nil)
     if url
-      each(url) { return false }
+      each(url, context: context) { return false }
       return true
     else
       @store.empty?
@@ -135,15 +160,31 @@ class HTTP::CookieJar
   #
   # If (and only if) the `uri` option is given, last access time of
   # each cookie is updated to the current time.
-  def each(uri = nil, &block) # :yield: cookie
-    block_given? or return enum_for(__method__, uri)
+  def each(uri = nil, context: nil, &block) # :yield: cookie
+    block_given? or return enum_for(__method__, uri, :context => context)
 
     if uri
       uri = HTTP::Cookie::URIParser.parse(uri)
       return self unless URI::HTTP === uri && uri.host
     end
 
-    @store.each(uri, &block)
+    context = case context
+              when nil then nil
+              when HTTP::Cookie::RequestContext then context
+              else raise TypeError, "invalid request context: #{context.inspect}"
+              end
+
+    if context
+      @store.each(uri, context) { |cookie|
+        if cookie.partitioned?
+          yield cookie if context.matches_partition?(cookie)
+        else
+          yield cookie if context.allows_same_site?(cookie)
+        end
+      }
+    else
+      @store.each(uri, &block)
+    end
     self
   end
   include Enumerable
@@ -164,18 +205,20 @@ class HTTP::CookieJar
   #
   # See HTTP::Cookie.parse for available options.
   def parse(set_cookie, origin, options = nil) # :yield: cookie
+    context = options && options[:context]
     if block_given?
       HTTP::Cookie.parse(set_cookie, origin, options).tap { |cookies|
         cookies.select! { |cookie|
-          yield(cookie) && add(cookie)
+          yield(cookie) && add(cookie, context)
         }
       }
     else
       HTTP::Cookie.parse(set_cookie, origin, options) { |cookie|
-        add(cookie)
+        add(cookie, context)
       }
     end
   end
+
 
   # call-seq:
   #   jar.save(filename_or_io, **options)
@@ -324,7 +367,23 @@ class HTTP::CookieJar
     @store.cleanup session
     self
   end
+
+  private
+
+  # Enforces attribute requirements that only become meaningful with
+  # an explicit request context (RFC 6265bis / CHIPS).
+  def validate_cookie_for_context(cookie)
+    if cookie.same_site_none? && !cookie.secure?
+      raise ArgumentError,
+        "SameSite=None cookies must have the Secure attribute"
+    end
+    if cookie.partitioned? && !(cookie.secure? && cookie.same_site_none?)
+      raise ArgumentError,
+        "Partitioned cookies must have the Secure and SameSite=None attributes"
+    end
+  end
 end
 
 require 'http/cookie_jar/abstract_store'
 require 'http/cookie_jar/abstract_saver'
+require 'http/cookie/request_context'

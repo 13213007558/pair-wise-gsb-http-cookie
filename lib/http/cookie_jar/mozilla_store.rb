@@ -9,7 +9,7 @@ class HTTP::CookieJar
   # stored persistently in the SQLite3 database.
   class MozillaStore < AbstractStore
     # :stopdoc:
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def default_options
       {
@@ -27,6 +27,7 @@ class HTTP::CookieJar
       expiry creationTime lastAccessed
       isSecure isHttpOnly
       appId inBrowserElement
+      isPartitioned topSiteOrigin
     ]
 
     SQL = {}
@@ -230,7 +231,9 @@ class HTTP::CookieJar
                      isHttpOnly INTEGER,
                      appId INTEGER DEFAULT 0,
                      inBrowserElement INTEGER DEFAULT 0,
-                     CONSTRAINT moz_uniqueid UNIQUE (name, host, path, originAttributes)
+                     isPartitioned INTEGER DEFAULT 0,
+                     topSiteOrigin TEXT NOT NULL DEFAULT '',
+                     CONSTRAINT moz_uniqueid UNIQUE (name, host, path, originAttributes, topSiteOrigin)
                    )
       SQL
       @db.execute(<<-'SQL')
@@ -238,6 +241,27 @@ class HTTP::CookieJar
                      ON moz_cookies (baseDomain,
                                      originAttributes);
       SQL
+    end
+
+    # Upgrades a v7 (or older) database to v8, adding the
+    # isPartitioned and topSiteOrigin columns used to keep CHIPS
+    # partitioned cookies apart.  The table is rebuilt so the unique
+    # constraint covers the partition key as well.
+    def upgrade_table_to_v8
+      @db.execute("ALTER TABLE moz_cookies RENAME TO moz_cookies_old")
+      @db.execute("DROP INDEX moz_basedomain")
+      create_table
+      @db.execute(<<-'SQL')
+                   INSERT INTO moz_cookies
+                     (baseDomain, originAttributes, name, value, host, path, expiry,
+                      lastAccessed, creationTime, isSecure, isHttpOnly, appId,
+                      inBrowserElement, isPartitioned, topSiteOrigin)
+                     SELECT baseDomain, originAttributes, name, value, host, path,
+                            expiry, lastAccessed, creationTime, isSecure, isHttpOnly,
+                            appId, inBrowserElement, 0, ''
+                       FROM moz_cookies_old
+      SQL
+      @db.execute("DROP TABLE moz_cookies_old")
     end
 
     def db_prepare(sql)
@@ -336,6 +360,10 @@ class HTTP::CookieJar
           SQL
           @logger.info("Upgraded database to schema version %d" % schema_version) if @logger
           self.schema_version += 1
+        when 7
+          upgrade_table_to_v8
+          @logger.info("Upgraded database to schema version %d" % schema_version) if @logger
+          self.schema_version += 1
         else
           break
         end
@@ -369,6 +397,8 @@ class HTTP::CookieJar
           :isHttpOnly => cookie.httponly? ? 1 : 0,
           :appId => @app_id,
           :inBrowserElement => @in_browser_element ? 1 : 0,
+          :isPartitioned => cookie.partitioned? ? 1 : 0,
+          :topSiteOrigin => cookie.partitioned? ? cookie.partition_key.to_s : '',
         })
       cleanup if (@gc_index += 1) >= @gc_threshold
 
@@ -381,7 +411,9 @@ class HTTP::CookieJar
               inBrowserElement = :inBrowserElement AND
               name = :name AND
               host = :host AND
-              path = :path
+              path = :path AND
+              isPartitioned = :isPartitioned AND
+              topSiteOrigin = :topSiteOrigin
     SQL
 
     def db_delete(cookie)
@@ -391,6 +423,8 @@ class HTTP::CookieJar
           :name => cookie.name,
           :host => cookie.dot_domain,
           :path => cookie.path,
+          :isPartitioned => cookie.partitioned? ? 1 : 0,
+          :topSiteOrigin => cookie.partitioned? ? cookie.partition_key.to_s : '',
         })
       self
     end
@@ -445,6 +479,7 @@ class HTTP::CookieJar
         WHERE baseDomain = :baseDomain AND
               appId = :appId AND
               inBrowserElement = :inBrowserElement AND
+              (isPartitioned = 0 OR topSiteOrigin = :topSiteOrigin) AND
               expiry >= :expiry
     SQL
 
@@ -461,7 +496,7 @@ class HTTP::CookieJar
               expiry >= :expiry
     SQL
 
-    def each(uri = nil, &block) # :yield: cookie
+    def each(uri = nil, context = nil, &block) # :yield: cookie
       now = Time.now
       if uri
         thost = DomainName.new(uri.host)
@@ -470,6 +505,7 @@ class HTTP::CookieJar
             :baseDomain => thost.domain || thost.hostname,
             :appId => @app_id,
             :inBrowserElement => @in_browser_element ? 1 : 0,
+            :topSiteOrigin => context ? context.top_level_site : '',
             :expiry => now.to_i,
           }).each { |row|
           if secure = row['isSecure'] != 0
@@ -486,6 +522,10 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = secure
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              if row['isPartitioned'] != 0
+                attrs[:partitioned]   = true
+                attrs[:partition_key] = row['topSiteOrigin']
+              end
             })
 
           if cookie.valid_for_uri?(uri)
@@ -497,7 +537,7 @@ class HTTP::CookieJar
             yield cookie
           end
         }
-        @sjar.each(uri, &block)
+      @sjar.each(uri, context, &block)
       else
         @stmt[:all_cookies].execute({
             :appId => @app_id,
@@ -514,6 +554,10 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = row['isSecure'] != 0
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              if row['isPartitioned'] != 0
+                attrs[:partitioned]   = true
+                attrs[:partition_key] = row['topSiteOrigin']
+              end
             })
 
           yield cookie
